@@ -1,9 +1,29 @@
 import { COLORS, HIGHLIGHT_RULES } from "./rules.js";
 
+/**
+ * Longest slice of a logical line the BUILT-IN rules are allowed to see.
+ *
+ * Even with every quantifier bounded, a line built entirely of quotes and
+ * backslashes makes each candidate start position re-scan to the end of the
+ * line, so the total stays proportional to the line length. A terminal row
+ * cannot display anywhere near this many cells, and the built-in rules are
+ * decoration, so cutting the tail off a pathological line costs nothing the
+ * user can see — it converts "cost grows with whatever `cat` printed" into a
+ * fixed ceiling.
+ *
+ * Custom user rules are exempt: their author chose the pattern, and silently
+ * matching only a prefix would change what their rule means. They stay guarded
+ * by the worker's own timeout, which reports the failure instead of hiding it.
+ */
+const MATCH_MAX_CHARS = 4096;
+
 // Tokenize a logical line. Reserve whole tokens before the cell-style filter,
 // so ANSI-styled fragments cannot make a lower-priority rule leak through.
 export function matchText(text, rules = HIGHLIGHT_RULES, colors = COLORS, limit = 4096) {
-  const occupied = new Uint8Array(text.length), spans = [];
+  // Only the built-in set gets the length ceiling (see MATCH_MAX_CHARS).
+  const bounded = rules === HIGHLIGHT_RULES && text.length > MATCH_MAX_CHARS;
+  const source = bounded ? text.slice(0, MATCH_MAX_CHARS) : text;
+  const occupied = new Uint8Array(source.length), spans = [];
   const add = (start, end, color) => {
     if (spans.length >= limit) return;
     if (!color) return;
@@ -12,26 +32,26 @@ export function matchText(text, rules = HIGHLIGHT_RULES, colors = COLORS, limit 
     occupied.fill(1, start, end); spans.push({ start, end, color });
   };
   // Context-only rules: don't mistake arbitrary output words for commands.
-  const prompt = /^(?![-+])[^\n]*?(?:[$#>]|(?<!\d)%)[ \t]+/.exec(text);
+  const prompt = /^(?![-+])[^\n]*?(?:[$#>]|(?<!\d)%)[ \t]+/.exec(source);
   const context = prompt ? prompt[0].length : -1;
   for (const rule of rules) {
     if (spans.length >= limit) break;
     if ((rule.id === "context" || (rule.id === "mac" && rule.context !== false)) && context >= 0) {
       const enabled = (key) => !Array.isArray(rule.context) || rule.context.includes(key);
-      for (const command of enabled("command") ? text.slice(context).matchAll(/(?:^|[|])\s*([\w.-]+)(?=\s|$)/g) : []) {
+      for (const command of enabled("command") ? source.slice(context).matchAll(/(?:^|[|])\s*([\w.-]+)(?=\s|$)/g) : []) {
         const start = context + command.index + command[0].lastIndexOf(command[1]);
         add(start, start + command[1].length, colors.command);
       }
       const sign = prompt[0].search(/[$#%>]/);
       if (enabled("prompt")) add(sign, sign + 1, colors.prompt);
-      for (const m of enabled("string") ? text.slice(context).matchAll(/(?:~?\/|[\w.-]+\/)[^\s"'|;<>]*/g) : []) add(context + m.index, context + m.index + m[0].length, colors.string);
+      for (const m of enabled("string") ? source.slice(context).matchAll(/(?:~?\/|[\w.-]+\/)[^\s"'|;<>]*/g) : []) add(context + m.index, context + m.index + m[0].length, colors.string);
     }
     // Per-rule context gate: rules flagged context:true (command/prompt/path/
     // flag detection) must not fire on plain output lines.
     if (rule.context === true && context < 0) continue;
     if (!rule.pattern) continue;
     const regex = new RegExp(rule.pattern.source, rule.pattern.flags.replace(/[gy]/g, "") + "g");
-    for (const m of text.matchAll(regex)) {
+    for (const m of source.matchAll(regex)) {
       if (spans.length >= limit) break;
       if (!m[0].length || (rule.accept && !rule.accept(m[0]))) continue;
       if (rule.option && m[0].includes("=")) {

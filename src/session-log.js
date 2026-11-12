@@ -137,7 +137,31 @@ export class SessionLogStore {
     entry.exitCode = exitCode;
     this.entries.delete(sessionId);
     await this.writeMeta(entry).catch(() => {});
+    // A finished session is the natural moment to enforce the directory
+    // budget. Without this call the `maxTotalBytes` limit was dead config: the
+    // directory only ever grew, and every session could leave another 8MB
+    // behind forever. Detached on purpose — pruning must never delay or fail
+    // a session close.
+    void this.maybePrune();
     return entry;
+  }
+
+  /**
+   * Run `prune()` at most once per interval.
+   *
+   * Pruning walks every sidecar file, so doing it on each close would put a
+   * directory scan in the path of every session a user opens and closes. A
+   * cooldown keeps the steady-state cost per close at zero while still
+   * bounding the directory within one interval of output.
+   */
+  maybePrune(intervalMs = 60_000) {
+    const at = Date.now();
+    if (this.pruning === true || at < (this.pruneAfter ?? 0)) return Promise.resolve(null);
+    this.pruning = true;
+    this.pruneAfter = at + intervalMs;
+    return this.prune()
+      .catch(() => null)
+      .finally(() => { this.pruning = false; });
   }
 
   async writeMeta(entry) {

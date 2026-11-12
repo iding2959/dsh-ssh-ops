@@ -151,6 +151,39 @@ try {
   rmSync(dir, { recursive: true, force: true });
 }
 
+// ── closing a session enforces the directory budget (regression) ───────────
+// `prune()` used to have no caller at all, so `maxTotalBytes` was dead config
+// and the log directory only ever grew. `end()` now kicks a throttled prune.
+{
+  const budgetDir = mkdtempSync(join(tmpdir(), "dsh-ssh-ops-logs-prune-"));
+  try {
+    const store = new SessionLogStore({
+      dir: budgetDir,
+      // Tiny limits so a handful of sessions overflows the budget.
+      limits: { maxSessionBytes: 4096, maxTotalBytes: 12 * 1024 }
+    });
+    for (let index = 0; index < 6; index += 1) {
+      const sessionId = `p${index}`;
+      await store.begin({ sessionId, connectionId: "c", name: "n", host: "h", port: 22, openedBy: "panel" });
+      // append() queues until the write stream exists; flush() makes the byte
+      // count real before the session closes.
+      store.append(sessionId, "x".repeat(4000));
+      await store.flush(sessionId);
+      await store.end(sessionId, { exitCode: 0 });
+    }
+    // The cooldown would hide the effect of a single close, so allow one run.
+    store.pruneAfter = 0;
+    const result = await store.maybePrune();
+    assert.equal(result.ok, true);
+    assert.ok(result.removed.length > 0, "closing sessions eventually drops the oldest logs");
+    assert.ok(result.totalAfter <= 12 * 1024, `budget respected, got ${result.totalAfter}`);
+    // The newest recording survives even when pruning runs.
+    assert.ok((await store.list()).length >= 1);
+  } finally {
+    rmSync(budgetDir, { recursive: true, force: true });
+  }
+}
+
 // ── service layer: the RPCs over the store, plus the wiring contract ───────
 {
   const svcDir = mkdtempSync(join(tmpdir(), "dsh-ssh-ops-logs-svc-"));

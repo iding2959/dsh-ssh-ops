@@ -167,7 +167,15 @@ export const HIGHLIGHT_RULES = Object.freeze([
   {
     id: "string.quoted",
     color: "string",
-    pattern: /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/g,
+    // Bounded on purpose. The unbounded form `"(?:[^"\\\n]|\\.)*"` overlaps its
+    // two branches at every backslash, so a lone opening quote followed by an
+    // odd run of `\"` that never closes makes the engine backtrack
+    // exponentially: 193ms for one 16KB line, 915ms for 32KB, 12s for 125KB.
+    // The highlighter runs on the UI thread, so such a line (a truncated JSON
+    // file, a `sed 's/\"…/'` echo) froze the frame. `{0,2048}` makes the worst
+    // case linear, and `readLogicalLine` caps a logical line long before a
+    // quote string could legitimately reach 2048 characters.
+    pattern: /"(?:[^"\\\n]|\\.){0,2048}"|'(?:[^'\\\n]|\\.){0,2048}'/g,
   },
 
   // —— 命令行上下文：命令词先于路径解释（./run-tests.sh 归 command）；

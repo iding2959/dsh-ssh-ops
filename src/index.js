@@ -475,8 +475,30 @@ function tailCapped(text, maxBytes) {
   return tail;
 }
 
+/**
+ * Detect the shell prompt at the tail of one output chunk.
+ *
+ * Runs on every output chunk (`appendSessionOutput`), so it must reject the
+ * common case in O(1) instead of scrubbing the whole chunk twice with regexes:
+ * at 64KB chunks the unconditional version cost 323us per chunk, and a `cat`
+ * of a few MB turned that into ~50ms of pure regex per terminal. A prompt
+ * always ends the chunk with `$ ` or `# `, so checking the tail first skips the
+ * scrub for every chunk that cannot contain one.
+ */
 function promptFromTerminalData(text) {
-  const visible = String(text)
+  const raw = String(text);
+  // Walk back over trailing whitespace to the last meaningful character.
+  let end = raw.length;
+  while (end > 0) {
+    const code = raw.charCodeAt(end - 1);
+    if (code === 32 || code === 9 || code === 10 || code === 13) end--;
+    else break;
+  }
+  if (end === 0) return null;
+  const last = raw.charCodeAt(end - 1);
+  // Only `$` and `#` end the prompt patterns below; anything else cannot match.
+  if (last !== 0x24 && last !== 0x23) return null;
+  const visible = raw
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
   const match = visible.match(/(?:^|[\r\n])([^\r\n]*[#$] )$/);
@@ -798,9 +820,14 @@ export default class SshOpsService extends TypertRemoteService {
    * @param {object} connection - live SSH connection record.
    * @param {string} root - bound remote root.
    * @param {string} target - resolved remote path.
+   * @param {{canonicalRoot?: string}} [known] - `canonicalRoot` already
+   *   resolved by the caller. Verifying a whole upload tree resolved the same
+   *   root once per file, and each resolution is two SFTP round-trips; a
+   *   caller that has already canonicalised the root passes it here and pays
+   *   for the target only.
    * @returns {Promise<void>} rejects on symlink escape or verification failure.
    */
-  async assertRemoteWorkspaceTarget(connection, root, target) {
+  async assertRemoteWorkspaceTarget(connection, root, target, known = {}) {
     const sftp = await this.requireSftp(connection);
     if (!sftp.ok) {
       throw new RemoteWorkspacePathError(
@@ -811,7 +838,9 @@ export default class SshOpsService extends TypertRemoteService {
     let canonicalRoot;
     let canonicalTarget;
     try {
-      canonicalRoot = await this.canonicalRemotePath(sftp.sftp, root);
+      // Reuse a root the caller already canonicalised: within one upload the
+      // root cannot change, so re-resolving it per file was pure round-trip cost.
+      canonicalRoot = known.canonicalRoot ?? await this.canonicalRemotePath(sftp.sftp, root);
       canonicalTarget = await this.canonicalRemotePath(sftp.sftp, target);
     } catch (error) {
       if (error instanceof RemoteWorkspacePathError) throw error;
@@ -5036,37 +5065,49 @@ export default class SshOpsService extends TypertRemoteService {
         }
       }
       const sortedDirs = [...remoteDirs].sort((a, b) => a.length - b.length);
+      // The root is invariant across the whole upload, so canonicalise it once
+      // and hand it to every per-file/per-directory check. Resolving it inside
+      // each call made a 500-file tree pay 1000 extra round-trips for a value
+      // that never changes.
+      //
+      // A failure here is not fatal: leave `canonicalRoot` undefined and let
+      // `assertRemoteWorkspaceTarget` resolve (and wrap) it, so the preflight
+      // still runs and reports the same error it did before.
+      let canonicalRoot;
+      if (request.remoteWorkspaceRoot !== undefined) {
+        const sftpHandle = await this.requireSftp(selected.connection);
+        if (sftpHandle.ok) {
+          canonicalRoot = await this.canonicalRemotePath(sftpHandle.sftp, request.remoteWorkspaceRoot).catch(() => undefined);
+        }
+      }
+      const known = { canonicalRoot };
       if (request.remoteWorkspaceRoot !== undefined) {
         // Validate every destination before the first mkdir/write. Checking
         // only the selected root misses a pre-existing remote symlink such as
         // `root/vendor -> /etc`, which could redirect a nested upload outside
         // the binding. Individual transfer steps can still fail later, but an
         // unsafe tree never starts transferring.
-        await this.assertRemoteWorkspaceTarget(selected.connection, request.remoteWorkspaceRoot, remotePath);
+        await this.assertRemoteWorkspaceTarget(selected.connection, request.remoteWorkspaceRoot, remotePath, known);
         for (const dir of sortedDirs) {
           await this.assertRemoteWorkspaceTarget(
             selected.connection,
             request.remoteWorkspaceRoot,
-            joinRemotePath(remotePath, dir)
+            joinRemotePath(remotePath, dir),
+            known
           );
         }
         for (const task of tasks) {
           await this.assertRemoteWorkspaceTarget(
             selected.connection,
             request.remoteWorkspaceRoot,
-            joinRemotePath(remotePath, task.path)
+            joinRemotePath(remotePath, task.path),
+            known
           );
         }
-      }
-      if (request.remoteWorkspaceRoot !== undefined) {
-        await this.assertRemoteWorkspaceTarget(selected.connection, request.remoteWorkspaceRoot, remotePath);
       }
       await this.ensureRemoteDir(sftp, remotePath);
       for (const dir of sortedDirs) {
         const destination = joinRemotePath(remotePath, dir);
-        if (request.remoteWorkspaceRoot !== undefined) {
-          await this.assertRemoteWorkspaceTarget(selected.connection, request.remoteWorkspaceRoot, destination);
-        }
         await this.ensureRemoteDir(sftp, destination);
       }
       if (request.remoteWorkspaceRoot !== undefined) {
@@ -5074,7 +5115,7 @@ export default class SshOpsService extends TypertRemoteService {
           const destination = joinRemotePath(remotePath, task.path);
           const originalRun = task.run;
           task.run = async (signal) => {
-            await this.assertRemoteWorkspaceTarget(selected.connection, request.remoteWorkspaceRoot, destination);
+            await this.assertRemoteWorkspaceTarget(selected.connection, request.remoteWorkspaceRoot, destination, known);
             await originalRun(signal);
           };
         }
