@@ -71,7 +71,10 @@ import { registerDbTools } from "./tools/db.js";
 import { registerSessionLogTools } from "./tools/session-log.js";
 import { t, setLanguage } from "./i18n/core.js";
 
-const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+// Terminal history retained per session. 2MB per session multiplied across a
+// few busy terminals kept the trimming path hot; 512KB still holds far more
+// than any xterm viewport can show, and a reattaching view only replays this.
+const MAX_BUFFER_BYTES = 512 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 const MAX_CAPTURE_BYTES = 128 * 1024;
 const READ_TIMEOUT_MS = 300;
@@ -123,6 +126,10 @@ const RECONNECT_WAIT_MS = 30000;
 // an empty item at this cadence, so the client can tell a live-but-quiet
 // terminal from a dead WebSocket mux.
 const STREAM_HEARTBEAT_MS = 15000;
+// UTF-16 characters handed to one stream frame. Bounds the per-iteration
+// read+base64 cost for a terminal under heavy output; the client's cursor
+// makes a chunked delivery indistinguishable from one large frame.
+const STREAM_READ_CHARS = 16 * 1024;
 // Streaming file plane (workbench S6 patch): plain-HTTP byte routes registered
 // on the DSH webserver, guarded by the connection service's Host/Origin +
 // browser-cookie fence (the same guard the typert gateway applies to /api and
@@ -158,6 +165,18 @@ function parseDbToolRegistration(raw = process.env.DSH_SSH_OPS_REGISTER_DB_TOOLS
   if (raw === undefined || raw === "1" || raw?.toLowerCase() === "true") return true;
   if (raw === "0" || raw?.toLowerCase() === "false") return false;
   throw new Error("DSH_SSH_OPS_REGISTER_DB_TOOLS must be 0, 1, true, or false");
+}
+
+/**
+ * Session recording switch, defaulting to on. Recording writes one stream
+ * chunk per output chunk; operators running several busy terminals can set
+ * DSH_SSH_OPS_SESSION_LOG=0 rather than editing the profile bundle.
+ */
+function parseSessionLogEnabled(raw = process.env.DSH_SSH_OPS_SESSION_LOG) {
+  if (raw === undefined) return true;
+  if (raw === "1" || raw.toLowerCase() === "true") return true;
+  if (raw === "0" || raw.toLowerCase() === "false") return false;
+  throw new Error("DSH_SSH_OPS_SESSION_LOG must be 0, 1, true, or false");
 }
 
 const profileRecordSchema = z.object({
@@ -412,9 +431,48 @@ function appendCapped(current, next, maxBytes) {
   return { text: current + incoming.subarray(0, remaining).toString("utf8"), truncated: true };
 }
 
+/**
+ * Append `next` to `current`, keeping the tail within `maxBytes`.
+ *
+ * The per-chunk path: while the buffer is under the cap this only measures the
+ * incoming chunk (never re-encodes the history), and it trims once the cap is
+ * crossed rather than on every subsequent chunk. Callers detect truncation by
+ * comparing the returned length with the sum of the inputs.
+ */
+function appendCappedString(current, next, maxBytes) {
+  const combined = current + next;
+  const incomingBytes = Buffer.byteLength(next, "utf8");
+  // Cheap case: both provably small. `next` is one chunk, so measuring it is
+  // bounded; measuring `current` on every call is exactly what we avoid.
+  if (current.length + next.length <= maxBytes && incomingBytes <= maxBytes) return combined;
+  if (current.length === 0) return tailCapped(combined, maxBytes);
+  // Only when the cap may be crossed do we pay for the history's real size.
+  const existingBytes = Buffer.byteLength(current, "utf8");
+  if (existingBytes + incomingBytes <= maxBytes) return combined;
+  // Trim to 3/4 of the cap so the next stretch of output is free.
+  return tailCapped(combined, Math.max(1, Math.floor(maxBytes * 0.75)));
+}
+
 function tailCapped(text, maxBytes) {
-  const bytes = Buffer.from(text, "utf8");
-  return bytes.length <= maxBytes ? text : bytes.subarray(bytes.length - maxBytes).toString("utf8");
+  if (text.length <= maxBytes && Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  // Over budget: cut from the tail, re-encoding only the tail eventually kept.
+  // Starting at maxBytes/3 characters guarantees enough of the tail is covered
+  // for any UTF-8 mix (3 bytes per code unit is the worst case).
+  let cut = Math.max(0, text.length - Math.ceil(maxBytes / 3));
+  const code = text.charCodeAt(cut);
+  if (code >= 0xdc00 && code <= 0xdfff) cut++;
+  let tail = text.slice(cut);
+  let bytes = Buffer.from(tail, "utf8");
+  while (bytes.length > maxBytes && cut < text.length) {
+    // Drop whole code points until the encoded tail fits.
+    const over = bytes.length - maxBytes;
+    cut = Math.min(text.length, cut + Math.max(1, Math.floor(over / 4)));
+    const c = text.charCodeAt(cut);
+    if (c >= 0xdc00 && c <= 0xdfff) cut++;
+    tail = text.slice(cut);
+    bytes = Buffer.from(tail, "utf8");
+  }
+  return tail;
 }
 
 function promptFromTerminalData(text) {
@@ -527,7 +585,10 @@ export default class SshOpsService extends TypertRemoteService {
       maxDbRows: parseDbRows(),
       // Session recording is on by default; the directory defaults to
       // ~/.dsh/ssh-ops-logs and is resolved lazily on first use.
-      sessionLogEnabled: true,
+      // Recording costs one stream write per output chunk, so an operator who
+      // runs many busy terminals can switch it off without editing the profile:
+      // DSH_SSH_OPS_SESSION_LOG=0.
+      sessionLogEnabled: parseSessionLogEnabled(),
       sessionLogDir: undefined,
       ...config
     };
@@ -2812,15 +2873,28 @@ export default class SshOpsService extends TypertRemoteService {
     try {
       let heartbeatFired = false;
       while (!signal?.aborted) {
-        const item = journal.read(cursor);
+        // Cap one iteration's payload. A terminal under a flood produced a
+        // 512KB read plus a 512KB base64 encode per loop turn; with a few
+        // open terminals that saturated the host. The wire format already
+        // tolerates partial reads — the client resumes from `offset`.
+        const item = journal.read(cursor, STREAM_READ_CHARS);
         const exit = session.exited;
         if (item.data !== "" || exit !== null || heartbeatFired) {
           cursor = item.offset;
           yield { ok: true, value: { ...item, data: encodeData(item.data), exit } };
         }
         if (exit !== null || signal?.aborted) return;
-        // Output can arrive while suspended at yield. Do not sleep over it.
-        if (journal.read(cursor).data !== "") continue;
+        // Output can arrive while suspended at yield. Do not sleep over it —
+        // but do yield to the event loop before retrying: `read()` returns
+        // everything past `cursor` and `encodeData` base64-encodes all of it,
+        // so a producer that keeps writing turns this `continue` into a
+        // synchronous spin that starves every other task in the host process.
+        // `cursor` was just advanced to `item.offset`, so the retry only sees
+        // output that arrived after this iteration.
+        if (journal.read(cursor).data !== "") {
+          await new Promise((resolve) => setImmediate(resolve));
+          continue;
+        }
         heartbeatFired = false;
         await new Promise((resolve) => {
           listener.wake = resolve;
@@ -5477,19 +5551,19 @@ export default class SshOpsService extends TypertRemoteService {
       }
     } catch { /* keep the session alive */ }
     try { session.shellIntegration?.feed(text); } catch { /* tracking is decoration */ }
-    // Legacy poll readers retain their independent destructive buffer.
-    session.buffer = tailCapped((session.buffer ?? "") + text, this.config.maxBufferBytes);
+    // This runs once per output chunk, so every buffer here trims only when it
+    // has actually overflowed: concatenating first and arguing about the cap
+    // afterwards made a saturated 2MB session re-encode on every chunk.
+    session.buffer = appendCappedString(session.buffer ?? "", text, this.config.maxBufferBytes);
     if (capture) {
       const captured = session.captureBuffer ?? "";
-      if (Buffer.byteLength(captured, "utf8") + Buffer.byteLength(text, "utf8") > this.config.maxCaptureBytes) {
-        session.captureHasDropped = true;
-      }
-      session.captureBuffer = tailCapped(captured + text, this.config.maxCaptureBytes);
+      const capturedNext = appendCappedString(captured, text, this.config.maxCaptureBytes);
+      if (capturedNext.length < captured.length + text.length) session.captureHasDropped = true;
+      session.captureBuffer = capturedNext;
       const pending = session.capturePendingBuffer ?? "";
-      if (Buffer.byteLength(pending, "utf8") + Buffer.byteLength(text, "utf8") > this.config.maxCaptureBytes) {
-        session.capturePendingTruncated = true;
-      }
-      session.capturePendingBuffer = tailCapped(pending + text, this.config.maxCaptureBytes);
+      const pendingNext = appendCappedString(pending, text, this.config.maxCaptureBytes);
+      if (pendingNext.length < pending.length + text.length) session.capturePendingTruncated = true;
+      session.capturePendingBuffer = pendingNext;
     }
     if (observePrompt) {
       const prompt = promptFromTerminalData(text);

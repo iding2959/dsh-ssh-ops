@@ -84,15 +84,32 @@ function sqliteColumns(stmt, rows) {
  */
 export function sqliteQuery(db, statement, bindings = [], maxRows = 200) {
   const stmt = db.prepare(statement);
+  // Iterate instead of `all()`: node:sqlite is synchronous, so materializing a
+  // whole result set blocks the host event loop for the entire scan — a
+  // SELECT over a 10M-row table froze every open terminal until it finished,
+  // and only afterwards did the cap throw the rows away. Reading maxRows+1
+  // rows (one extra to detect truncation) bounds the work to what is returned.
+  //
   // node:sqlite hands back null-prototype objects; every other driver returns
   // plain ones, and downstream code mixes rows from both paths.
-  const rows = stmt.all(...bindings).map((row) => ({ ...row }));
-  const truncated = rows.length > maxRows;
+  const rows = [];
+  let truncated = false;
+  const iter = stmt.iterate(...bindings);
+  try {
+    for (const row of iter) {
+      if (rows.length >= maxRows) { truncated = true; break; }
+      rows.push({ ...row });
+    }
+  } finally {
+    // An early break leaves the iterator open; closing it releases the
+    // statement lock so the next query on this connection is not blocked.
+    try { iter.return?.(); } catch { /* already exhausted */ }
+  }
   return {
     // Same shape as the mysql/pg paged results (fieldNames), so the shared
     // query/export consumers stay driver-agnostic.
     fieldNames: sqliteColumns(stmt, rows),
-    rows: truncated ? rows.slice(0, maxRows) : rows,
+    rows,
     truncated
   };
 }
