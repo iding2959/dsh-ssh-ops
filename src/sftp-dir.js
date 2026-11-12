@@ -24,6 +24,36 @@ export const SFTP_DIR_SMALL_CONCURRENCY = 6;
 export const SFTP_DIR_BIG_FILE_BYTES = 512 * 1024;
 
 /**
+ * Run `worker` over `items` with at most `limit` in flight, preserving order
+ * of completion rather than result order (callers here collect into a shared
+ * array). Rejects on the first failure — a directory walk that cannot list one
+ * directory must not report a partial tree as complete.
+ *
+ * A worker pool rather than `Promise.all(items.map(...))`: ssh2 multiplexes
+ * every channel over one connection, so an unbounded fan-out over a large
+ * directory tree would queue thousands of requests and starve the terminals
+ * sharing that transport.
+ */
+export async function runBounded(items, limit, worker) {
+  const list = [...items];
+  const width = Math.max(1, Math.min(limit, list.length));
+  let next = 0;
+  let failed = false;
+  const pump = async () => {
+    while (!failed && next < list.length) {
+      const index = next++;
+      try {
+        await worker(list[index], index);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: width }, pump));
+}
+
+/**
  * Run transfer tasks under the scheduling policy. Returns
  * `{ files, bytes, failures }` where `failures` is `[{ path, error }]`.
  */

@@ -9,6 +9,8 @@ import { t } from "../i18n/core.js";
 import { searchRemoteFiles } from "./remote-file-search.js";
 import { streamDownload } from "./stream-download.js";
 import { checkpointDestination, checkpointFile, createDownloadCheckpoint, deleteDownloadCheckpoint, listDownloadCheckpoints, withDownloadLock } from "./download-checkpoints.js";
+import { startVisiblePoll } from "./visible-poll.js";
+
 const { useEffect, useState } = React;
 
 function joinPath(base, name) {
@@ -72,8 +74,10 @@ export function SshFiles({ api, connectionId, onCd, initialPath = "/" }) {
       try { const result = await api.sftpTransferList(connectionId); if (active) setAgentTasks(result.transfers ?? []); } catch { /* Older hosts may not expose the registry. */ }
     };
     void refresh();
-    const timer = setInterval(refresh, 1500);
-    return () => { active = false; clearInterval(timer); };
+    // 1.5s cadence is the tightest loop in the plugin; it must not keep firing
+    // while the page is backgrounded or the file tab is not the active one.
+    const stopPoll = startVisiblePoll(refresh, { intervalMs: 1500, immediate: false });
+    return () => { active = false; stopPoll(); };
   }, [api, connectionId]);
 
   const refreshCheckpoints = async (identity = favoritesStorageKey) => {

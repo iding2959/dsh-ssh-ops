@@ -256,7 +256,8 @@ try {
     [logs, /删除所选 \$\{ids\.length\} 条会话日志？此操作不可恢复/, "batch delete confirms before deleting"],
     [tools, /modelLogView\(service, args\.session_id\)/, "agent searches use the sanitized view"],
     [api, /sessionLogRead\(sessionId, offset, maxBytes\)/, "the api wrapper forwards paging arguments"],
-    [tools, /redactForModel\(toReadableText\(result\.value\.toString\("utf8"\)\)\)/, "agent reads are sanitized before paging"],
+    [tools, /redactForModel\(readable\)/, "agent reads are sanitized before paging"],
+    [tools, /await toReadableTextAsync\(/, "agent reads render off the event loop instead of blocking it"],
     [tools, /kind: "ask"/, "agent log reads ask the operator first"]
   ];
   for (const [source, pattern, label] of checks) {

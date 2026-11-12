@@ -17,6 +17,29 @@ const clientOut = resolve(rootDir, "lib/client.js");
 // the bundle never carries the whole manifest.
 const manifest = JSON.parse(readFileSync(resolve(rootDir, "package.json"), "utf8"));
 
+/**
+ * Drop zod's locale catalogue from the client bundle.
+ *
+ * `zod` reaches the browser through client → remote.js → descriptors.js →
+ * schemas.js, and it was 444KB of the 1179KB bundle (37.7%) — of which 255KB
+ * was `v4/locales/` (64 language packs: he, ru, be, hy, ta, …). The client
+ * never validates anything: it hands the descriptor objects to `$mount()` and
+ * the host does the parsing, so none of that catalogue can ever be reached.
+ *
+ * Only the aggregate `locales/index.js` is emptied. `v4/classic/schemas.js`
+ * imports `locales/en.js` directly to register the default English locale, so
+ * replacing the whole directory would break zod's own error messages.
+ */
+const dropZodLocaleCatalogue = {
+  name: "drop-zod-locale-catalogue",
+  setup(build) {
+    build.onLoad({ filter: /node_modules[\\/]zod[\\/]v4[\\/]locales[\\/]index\.js$/ }, () => ({
+      contents: "export {};",
+      loader: "js"
+    }));
+  }
+};
+
 const worker = await build({
   entryPoints: [resolve(rootDir, "src/client/terminal-display/highlight-worker.js")],
   bundle: true, write: false, platform: "browser", format: "iife", target: "es2022", minify: true
@@ -34,6 +57,7 @@ await build({
   // xterm/zod are inlined; react stays external (resolved by the host page
   // through the ModuleLoader seed table).
   external: ["react", "react/*", "@deepseek-ai/*"],
+  plugins: [dropZodLocaleCatalogue],
   logLevel: "info"
 });
 

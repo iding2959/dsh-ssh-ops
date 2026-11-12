@@ -6,7 +6,7 @@
  */
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { redactForModel } from "../redact.js";
-import { toReadableText } from "../terminal-text.js";
+import { toReadableTextAsync } from "../terminal-text.js";
 import { t } from "../i18n/core.js";
 
 const MAX_READ_BYTES = 48 * 1024;
@@ -14,10 +14,16 @@ const MAX_MODEL_LOG_BYTES = 8 * 1024 * 1024;
 
 // Sanitize the complete bounded recording before slicing it. Both tools use
 // offsets in the sanitized UTF-8 view so no page can begin inside a secret.
+//
+// The render runs through the async entry point: on an 8MB recording the
+// synchronous `toReadableText` holds the event loop for ~650ms, freezing every
+// other session and terminal in the host while a background read is in
+// progress. The output is identical either way — only the waiting changes.
 async function modelLogView(service, sessionId) {
   const result = await service.sessionLogSnapshot(sessionId, MAX_MODEL_LOG_BYTES);
   if (!result.ok) throw new Error(`ssh_session_log_read failed: ${result.error.message}`);
-  return Buffer.from(redactForModel(toReadableText(result.value.toString("utf8"))).text, "utf8");
+  const readable = await toReadableTextAsync(result.value.toString("utf8"));
+  return Buffer.from(redactForModel(readable).text, "utf8");
 }
 
 export function registerSessionLogTools(ctx, service) {

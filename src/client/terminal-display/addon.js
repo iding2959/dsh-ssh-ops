@@ -96,7 +96,15 @@ export class OutputHighlightAddon {
    */
   startViewportPoll() {
     if (this.pollTimer !== undefined || typeof setInterval !== "function") return;
-    this.pollTimer = setInterval(() => this.syncViewport(), this.viewportPollMs);
+    // Skip the check entirely while the document is hidden. `syncViewport` is
+    // only two integer reads, but this timer exists per terminal (one per
+    // pooled session), so a background window with eight of them runs 32
+    // no-op timers per second for a viewport nobody is looking at.
+    this.pollTimer = setInterval(() => {
+      if (typeof document !== "undefined" && document !== null
+        && (document.visibilityState === "hidden" || document.hidden === true)) return;
+      this.syncViewport();
+    }, this.viewportPollMs);
     this.pollTimer?.unref?.();
   }
   /** Request a scan when the viewport moved since the last known position. */

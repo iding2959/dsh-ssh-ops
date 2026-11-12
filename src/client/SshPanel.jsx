@@ -50,6 +50,8 @@ import {
 import { t } from "../i18n/core.js";
 import { useLanguage } from "./locale.js";
 
+import { startVisiblePoll } from "./visible-poll.js";
+
 const { useEffect, useRef, useState, useSyncExternalStore, Component } = React;
 
 /** Error boundary so a crash in one tab (Files/Tunnels) never closes the panel. */
@@ -1021,8 +1023,8 @@ export function SshPanel({ api, credentials, viewId = DEFAULT_VIEW_ID, viewSigna
   useEffect(() => {
     ensureStyles();
     refreshConnections(api);
-    const timer = setInterval(() => refreshConnections(api), 5000);
-    return () => clearInterval(timer);
+    const stopPoll = startVisiblePoll(() => refreshConnections(api), { intervalMs: 5000, immediate: false });
+    return stopPoll;
   }, [api]);
 
   useEffect(() => {
@@ -1064,8 +1066,12 @@ export function SshPanel({ api, credentials, viewId = DEFAULT_VIEW_ID, viewSigna
 
   useEffect(() => {
     refreshBatchTasks();
-    const timer = setInterval(refreshBatchTasks, 1000);
-    return () => clearInterval(timer);
+    // This used to poll every second for a list that is empty in the steady
+    // state — 1.0 request/s of pure overhead, a third of the plugin's whole
+    // polling budget. Batch tasks are started by an agent and are not
+    // second-sensitive; 3s still surfaces one long before a user would look.
+    const stopPoll = startVisiblePoll(refreshBatchTasks, { intervalMs: 3000, immediate: false });
+    return stopPoll;
   }, [api]);
 
   // Split panes are sibling trees over one connection list, and the dock kit

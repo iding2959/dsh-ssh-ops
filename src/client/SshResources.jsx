@@ -37,6 +37,8 @@ function RefreshIcon() {
   );
 }
 
+import { startVisiblePoll } from "./visible-poll.js";
+
 const { useEffect, useRef, useState } = React;
 const LEGACY_PROFILES_KEY = "dsh-ssh-ops.server-profiles.v1";
 
@@ -568,8 +570,11 @@ export function SshResources({ api, credentials, pluginManager, openPluginManage
     // The connected badge reflects live server-side connections, which also
     // change from outside this page (SSH panel ×, agent, disconnects). Poll
     // so the badge and its 断开 control never go stale.
-    const timer = setInterval(() => { if (alive) refresh({ showLoading: false }); }, 5000);
-    return () => { alive = false; clearInterval(timer); };
+    const stopPoll = startVisiblePoll(
+      () => (alive ? refresh({ showLoading: false }) : undefined),
+      { intervalMs: 5000, immediate: false }
+    );
+    return () => { alive = false; stopPoll(); };
   }, [api]);
 
   const toggleAgentAutoConnect = async (event) => {

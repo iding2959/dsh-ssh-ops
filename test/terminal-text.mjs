@@ -4,7 +4,7 @@
 // (shell-integration markers from a real server, an OSC 7 cwd report, an
 // OSC 1337 command, colour codes and bracketed-paste toggles).
 import assert from "node:assert/strict";
-import { readableLine, toReadableText } from "../src/terminal-text.js";
+import { readableLine, toReadableText, toReadableTextAsync } from "../src/terminal-text.js";
 
 const ESC = "\u001b";
 
@@ -64,6 +64,30 @@ const ESC = "\u001b";
   assert.equal(readableLine(`  ${ESC}[32mok${ESC}[0m  `), "  ok", "leading spaces (prompt indentation) stay");
   assert.equal(readableLine(""), "");
   assert.equal(readableLine(null), "");
+}
+
+// ── the async (non-blocking) entry renders exactly the same text ───────────
+// `toReadableTextAsync` exists so a large recording does not hold the event
+// loop; it is a second copy of the same state machine, so the two must agree
+// byte for byte or the panel and the agent would see different logs.
+{
+  const fixtures = [
+    `${ESC}[32mok${ESC}[0m done\r\n`,
+    // A bare CR rewinds the row: chunking the input cannot preserve this, which
+    // is why the async path keeps one pass and only yields control.
+    "aaa\r\nbbb\rccc\r\nddd",
+    "progress 10%\rprogress 55%\rprogress 100%\n",
+    `${ESC}[1;31mred${ESC}[0m\ttab\r\n`,
+    `emoji ${ESC}]0;title\u0007 中文\r\n`,
+    `${ESC}[2Kpartial${ESC}[3Gcol\r\n`
+  ];
+  for (const fixture of fixtures) {
+    assert.equal(await toReadableTextAsync(fixture, 1), toReadableText(fixture), `async agrees on ${JSON.stringify(fixture.slice(0, 24))}`);
+    assert.equal(await toReadableTextAsync(fixture, 1_000_000), toReadableText(fixture), "yield cadence does not change the result");
+  }
+  // A payload past the yield threshold must still match exactly.
+  const big = `${ESC}[32mline${ESC}[0m\r\n`.repeat(20_000);
+  assert.equal(await toReadableTextAsync(big, 65536), toReadableText(big));
 }
 
 console.log("terminal text: escape debris stripped, prompts and content preserved");
