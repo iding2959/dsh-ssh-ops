@@ -45,6 +45,7 @@ import {
   resolvePaneActiveConnection,
   selectInView,
   subscribePaneSessions,
+  visiblePaneConnections,
   viewSession
 } from "./pane-selection.js";
 import { t } from "../i18n/core.js";
@@ -329,7 +330,14 @@ function XtermView({ api, sessionId, connectionId }) {
 
     const controller = new AbortController();
     const NO_SESSION_NOTICE = t(`\r\n\x1b[31m[终端会话已失效：DSH 服务已重启或该连接已关闭。请到 设置 → SSH 资源 重新连接]\x1b[0m\r\n`);
-    const EXIT_NOTICE = `\r\n\x1b[90m[session exited]\x1b[0m\r\n`;
+    const exitNotice = (exit) => {
+      const message = exit.reason === "transport-lost" ? t("SSH 连接中断，原终端已结束。请打开新终端。")
+        : exit.reason === "channel-closed" || exit.reason === "channel-error" ? t("终端通道关闭，远端未返回退出状态。")
+        : exit.reason === "operator-close" ? t("终端已关闭。")
+        : exit.reason === "remote-signal" ? t("远端终端被信号终止。")
+        : t(`远端终端已退出（退出码 ${exit.code}）。`);
+      return `\r\n\x1b[90m[${message}]\x1b[0m\r\n`;
+    };
     const markClosed = () => {
       // The closed flag belongs to the session, not this mount: a remount
       // (tab switch back, sidebar reopen) must not reset it.
@@ -341,7 +349,7 @@ function XtermView({ api, sessionId, connectionId }) {
       if (fresh) term.write(fresh);
       if (exit !== null) {
         markClosed();
-        term.write(EXIT_NOTICE);
+        term.write(exitNotice(exit));
         return true;
       }
       return false;
@@ -567,6 +575,7 @@ function ConnectDialog({ api, credentials, onClose, onConnected }) {
   const [profiles, setProfiles] = useState([]);
   const [sharedCredentials, setSharedCredentials] = useState([]);
   const [selectedProfileId, setSelectedProfileId] = useState("");
+  const profilePickerRef = useRef(null);
   // Off by default: joining a live connection makes this pane share that
   // connection's single shell, so both panes would mirror each other and the
   // operator could not work in them independently. Opting in is for deliberately
@@ -585,6 +594,14 @@ function ConnectDialog({ api, credentials, onClose, onConnected }) {
     }).catch(() => {});
     return () => { alive = false; };
   }, [api]);
+
+  useEffect(() => {
+    const dismiss = (event) => {
+      if (profilePickerRef.current && !profilePickerRef.current.contains(event.target)) profilePickerRef.current.open = false;
+    };
+    document.addEventListener("pointerdown", dismiss);
+    return () => document.removeEventListener("pointerdown", dismiss);
+  }, []);
 
   const set = (key) => (event) => setForm((f) => ({ ...f, [key]: event.target.value }));
 
@@ -751,11 +768,19 @@ function ConnectDialog({ api, credentials, onClose, onConnected }) {
     }
   };
 
-  const selectProfile = (event) => {
-    const id = event.target.value;
+  const selectProfile = (id) => {
     setSelectedProfileId(id);
     setError(null);
+    if (profilePickerRef.current) profilePickerRef.current.open = false;
   };
+
+  const profileGroups = new Map();
+  for (const profile of profiles) {
+    const key = profile.groupId ?? "";
+    if (!profileGroups.has(key)) profileGroups.set(key, { name: profile.groupName || t("未分组"), profiles: [] });
+    profileGroups.get(key).profiles.push(profile);
+  }
+  const selectedProfile = profiles.find((profile) => profile.profileId === selectedProfileId);
 
   return (
     <div style={panelStyles.dialogBackdrop} onClick={busy ? undefined : onClose}>
@@ -763,17 +788,29 @@ function ConnectDialog({ api, credentials, onClose, onConnected }) {
         <div style={panelStyles.dialogTitle}>{t("连接服务器")}</div>
         {profiles.length > 0 && (
           <div style={panelStyles.savedProfileRow}>
-            <label style={{ ...panelStyles.field, flex: 1 }}>
+            <div style={{ ...panelStyles.field, flex: 1, minWidth: 0 }}>
               <span>{t("已保存的服务器（单选连接）")}</span>
-              <select value={selectedProfileId} onChange={selectProfile} style={panelStyles.input}>
-                <option value="">{t("选择一台服务器…")}</option>
-                {profiles.map((profile) => (
-                  <option key={profile.profileId} value={profile.profileId}>
-                    {profile.name || profile.host} — {profile.username}@{profile.host}:{profile.port}
-                  </option>
-                ))}
-              </select>
-            </label>
+              <details ref={profilePickerRef} style={panelStyles.profilePickerWrap} onKeyDown={(event) => {
+                if (event.key === "Escape") { event.stopPropagation(); profilePickerRef.current.open = false; profilePickerRef.current.querySelector("summary")?.focus(); }
+              }}>
+                <summary style={panelStyles.profilePickerTrigger}>
+                  {selectedProfile ? `${selectedProfile.name || selectedProfile.host} — ${selectedProfile.username}@${selectedProfile.host}:${selectedProfile.port}` : t("选择一台服务器…")}
+                </summary>
+                <div style={panelStyles.profilePicker}>
+                  <button type="button" onClick={() => selectProfile("")} aria-pressed={!selectedProfileId} style={panelStyles.profileChoice}>{t("临时连接")}</button>
+                  {[...profileGroups.entries()].map(([key, group]) => (
+                    <details key={key}>
+                      <summary style={panelStyles.profileGroup}>{group.name} ({group.profiles.length})</summary>
+                      {group.profiles.map((profile) => (
+                        <button type="button" key={profile.profileId} onClick={() => selectProfile(profile.profileId)} aria-pressed={selectedProfileId === profile.profileId} style={panelStyles.profileChoice}>
+                          {selectedProfileId === profile.profileId ? "✓ " : ""}{profile.name || profile.host} — {profile.username}@{profile.host}:{profile.port}
+                        </button>
+                      ))}
+                    </details>
+                  ))}
+                </div>
+              </details>
+            </div>
             {selectedProfileId && (
               <label style={panelStyles.reuseToggle} title={t("默认各自一条独立通道；勾选后本栏将加入已打开的那条连接，与另一栏共用同一个终端")}>
                 <input type="checkbox" checked={reuseExisting} onChange={(event) => setReuseExisting(event.target.checked)} />
@@ -1079,7 +1116,7 @@ export function SshPanel({ api, credentials, viewId = DEFAULT_VIEW_ID, viewSigna
   // this pane shows therefore lives in the shared pane store, keyed by the
   // host's tab id, so a split carries the pane's servers across the remount.
   const view = useSyncExternalStore(subscribePaneSessions, () => viewSession(viewId));
-  const paneConnections = ui.connections.filter((connection) => view.connectionIds.includes(connection.connectionId));
+  const paneConnections = visiblePaneConnections(ui.connections, view.connectionIds);
   const resolvedActiveConnectionId = resolvePaneActiveConnection(paneConnections, view.activeConnectionId);
   const active = paneConnections.find((c) => c.connectionId === resolvedActiveConnectionId);
 
@@ -1133,6 +1170,7 @@ export function SshPanel({ api, credentials, viewId = DEFAULT_VIEW_ID, viewSigna
    */
   const bindAgent = (connectionId) => {
     if (connectionId === null || connectionId === ui.activeConnectionId) return;
+    if (ui.connections.find((connection) => connection.connectionId === connectionId)?.connected === false) return;
     api.selectConnection(connectionId)
       .then(() => refreshConnections(api))
       .catch((error) => {
@@ -1560,7 +1598,7 @@ function ExecPolicyPill({ api, connectionId }) {
               <div style={{ ...panelStyles.policyMenuItemTitle, ...(candidate === "allowAll" ? panelStyles.policyMenuItemAllowAll : {}) }}>{execPolicyLabel(candidate)}{candidate === tier ? t("（当前）") : ""}</div>
               <div style={panelStyles.policyMenuItemDesc}>
                 {candidate === "standard" && t("破坏性命令一律拦截，由操作者在会话内审批后才执行")}
-                {candidate === "custom" && t("仅放行勾选的类别，其余照常拦截")}
+                {candidate === "custom" && t("放行勾选的类别及精确匹配的命令")}
                 {candidate === "allowAll" && t("AI 可直接执行任何命令，含不可逆删除（不进回收站）")}
               </div>
             </button>
@@ -1819,6 +1857,11 @@ const panelStyles = {
   field: { display: "flex", flexDirection: "column", gap: 4, fontSize: 12, color: "var(--dsh-ssh-ops-muted, #9aa3af)", minWidth: 0 },
   formRow: { display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 },
   savedProfileRow: { display: "flex", alignItems: "flex-end", flexWrap: "wrap", gap: 8 },
+  profilePickerWrap: { position: "relative" },
+  profilePickerTrigger: { padding: "8px 10px", background: "var(--dsh-ssh-ops-input, #101418)", border: "1px solid var(--dsh-ssh-ops-border, #3a4352)", borderRadius: 6, cursor: "pointer", overflowWrap: "anywhere" },
+  profilePicker: { position: "absolute", zIndex: 2, top: "calc(100% + 4px)", left: 0, right: 0, maxHeight: "min(300px, 45vh)", overflowY: "auto", background: "var(--dsh-ssh-ops-surface, #181c22)", border: "1px solid var(--dsh-ssh-ops-border, #3a4352)", borderRadius: 6, boxShadow: "0 8px 24px rgba(0,0,0,.4)" },
+  profileGroup: { cursor: "pointer", padding: "7px 10px", fontWeight: 600 },
+  profileChoice: { display: "block", width: "100%", padding: "7px 10px", border: 0, background: "transparent", color: "inherit", textAlign: "left", cursor: "pointer", overflowWrap: "anywhere" },
   reuseToggle: {
     display: "flex",
     alignItems: "center",
